@@ -1,0 +1,44 @@
+esekf_node:
+  ros__parameters:
+    vio_delay_s: 0.0
+    publish_rate_hz: 50.0
+
+    use_vio_twist_velocity: true
+    smooth_vio_anchor_velocity: false
+    vio_velocity_alpha: 1.0
+
+    use_imu_gyro_for_orientation_prediction: true
+
+    use_imu_accel_for_position_prediction: false
+
+    use_imu_accel_for_velocity_prediction: true
+    imu_velocity_prediction_gain: 0.55
+    imu_velocity_prediction_gain_xy: 0.05
+    imu_velocity_prediction_gain_z: 0.20
+
+    max_imu_prediction_horizon_s: 0.080
+    max_imu_velocity_delta_xy_mps: 0.020
+    max_imu_velocity_delta_z_mps: 0.080
+    max_imu_position_delta_xy_m: 0.005
+    max_imu_position_delta_z_m: 0.010
+
+    imu_accel_lpf_tau_s: 0.080
+    imu_accel_deadband_mps2: 0.12
+
+    use_vio_twist_ramp_prediction: true
+    use_vio_twist_ramp_for_z_only: true
+    vio_twist_ramp_gain: 1.05
+    vio_twist_ramp_accel_lpf_tau_s: 0.22
+    max_vio_twist_ramp_horizon_s: 0.14
+    max_vio_twist_ramp_delta_xy_mps: 0.00
+    max_vio_twist_ramp_delta_z_mps: 0.24
+
+    enable_pose_output_smoothing: false
+    enable_twist_output_smoothing: true
+    twist_output_smoothing_tau_s: 0.006
+
+    max_output_position_error_m: 0.05
+
+    max_prediction_horizon_s: 0.18
+    extra_prediction_s: 0.030
+    imu_buffer_s: 2.0
