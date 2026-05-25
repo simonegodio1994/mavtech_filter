@@ -1,0 +1,26 @@
+esekf_node:
+  ros__parameters:
+    imu_topic: "/imu/data"
+    vio_topic: "/vio/odom_ned"
+    odom_topic: "/mavtech_filter/odom_ned"
+
+    world_frame_id: "world_ned"
+    body_frame_id: "base_link"
+
+    publish_rate_hz: 50.0
+    gravity_mps2: 9.80665
+
+    # Use VIO twist as measurement only if the VIO odometry twist is reliable and in NED/world frame.
+    use_vio_velocity: false
+
+    # Noise tuning. Start conservative, then tune with logs.
+    gyro_noise_density: 0.001
+    accel_noise_density: 0.05
+    gyro_bias_random_walk: 0.00001
+    accel_bias_random_walk: 0.0001
+
+    vio_pos_std: 0.05
+    vio_ori_std_rad: 0.03
+    vio_vel_std: 0.20
+
+    vio_delay_s: 0.060
