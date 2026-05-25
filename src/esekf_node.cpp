@@ -1,18 +1,17 @@
+\
 #include "mavtech_filter/esekf_node.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <deque>
 
 namespace mavtech_filter
 {
 
 namespace
 {
-constexpr double kMinDt = 1.0e-5;
-constexpr double kMaxDt = 0.05;  // Protect against bag jumps/stalls.
-constexpr double kDegenerateCovThreshold = 1.0e-12;
+constexpr double kMinDt = 1.0e-6;
+constexpr double kMaxImuDt = 0.02;
 }  // namespace
 
 QuadEsekfNode::QuadEsekfNode(const rclcpp::NodeOptions & options)
@@ -25,23 +24,106 @@ QuadEsekfNode::QuadEsekfNode(const rclcpp::NodeOptions & options)
   world_frame_id_ = declare_parameter<std::string>("world_frame_id", "world_ned");
   body_frame_id_ = declare_parameter<std::string>("body_frame_id", "base_link");
 
-  publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 30.0);
-  gravity_mps2_ = declare_parameter<double>("gravity_mps2", 9.80665);
-  use_vio_velocity_ = declare_parameter<bool>("use_vio_velocity", false);
-  publish_until_initialized_ = declare_parameter<bool>("publish_until_initialized", false);
-  enable_delayed_vio_repropagation_ =
-      declare_parameter<bool>("enable_delayed_vio_repropagation", true);
+  publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 50.0);
   vio_delay_s_ = declare_parameter<double>("vio_delay_s", 0.0);
-  history_buffer_s_ = declare_parameter<double>("history_buffer_s", 2.0);
+  max_prediction_horizon_s_ = declare_parameter<double>("max_prediction_horizon_s", 0.12);
+  extra_prediction_s_ = declare_parameter<double>("extra_prediction_s", 0.0);
+  imu_buffer_s_ = declare_parameter<double>("imu_buffer_s", 2.0);
 
-  gyro_noise_density_ = declare_parameter<double>("gyro_noise_density", 1.0e-3);
-  accel_noise_density_ = declare_parameter<double>("accel_noise_density", 5.0e-2);
-  gyro_bias_random_walk_ = declare_parameter<double>("gyro_bias_random_walk", 1.0e-5);
-  accel_bias_random_walk_ = declare_parameter<double>("accel_bias_random_walk", 1.0e-4);
+  gravity_mps2_ = declare_parameter<double>("gravity_mps2", 9.80665);
+  use_imu_gyro_for_orientation_prediction_ =
+      declare_parameter<bool>("use_imu_gyro_for_orientation_prediction", true);
+  use_imu_accel_for_velocity_prediction_ =
+      declare_parameter<bool>("use_imu_accel_for_velocity_prediction", true);
+  use_imu_accel_for_position_prediction_ =
+      declare_parameter<bool>("use_imu_accel_for_position_prediction", true);
 
-  vio_pos_std_ = declare_parameter<double>("vio_pos_std", 0.05);
-  vio_ori_std_rad_ = declare_parameter<double>("vio_ori_std_rad", 0.03);
-  vio_vel_std_ = declare_parameter<double>("vio_vel_std", 0.20);
+  imu_velocity_prediction_gain_ =
+      declare_parameter<double>("imu_velocity_prediction_gain", 0.70);
+  imu_position_prediction_gain_ =
+      declare_parameter<double>("imu_position_prediction_gain", 0.70);
+
+  imu_velocity_prediction_gain_xy_ =
+      declare_parameter<double>("imu_velocity_prediction_gain_xy", 0.15);
+  imu_velocity_prediction_gain_z_ =
+      declare_parameter<double>("imu_velocity_prediction_gain_z", 0.25);
+  max_imu_prediction_horizon_s_ =
+      declare_parameter<double>("max_imu_prediction_horizon_s", 0.08);
+  max_imu_velocity_delta_xy_mps_ =
+      declare_parameter<double>("max_imu_velocity_delta_xy_mps", 0.12);
+  max_imu_velocity_delta_z_mps_ =
+      declare_parameter<double>("max_imu_velocity_delta_z_mps", 0.16);
+  max_imu_position_delta_xy_m_ =
+      declare_parameter<double>("max_imu_position_delta_xy_m", 0.025);
+  max_imu_position_delta_z_m_ =
+      declare_parameter<double>("max_imu_position_delta_z_m", 0.035);
+
+  imu_accel_lpf_tau_s_ =
+      declare_parameter<double>("imu_accel_lpf_tau_s", 0.04);
+  imu_accel_deadband_mps2_ =
+      declare_parameter<double>("imu_accel_deadband_mps2", 0.08);
+
+  use_vio_twist_ramp_prediction_ =
+      declare_parameter<bool>("use_vio_twist_ramp_prediction", true);
+  use_vio_twist_ramp_for_z_only_ =
+      declare_parameter<bool>("use_vio_twist_ramp_for_z_only", true);
+  vio_twist_ramp_gain_ =
+      declare_parameter<double>("vio_twist_ramp_gain", 0.85);
+  vio_twist_ramp_accel_lpf_tau_s_ =
+      declare_parameter<double>("vio_twist_ramp_accel_lpf_tau_s", 0.22);
+  max_vio_twist_ramp_horizon_s_ =
+      declare_parameter<double>("max_vio_twist_ramp_horizon_s", 0.10);
+  max_vio_twist_ramp_delta_xy_mps_ =
+      declare_parameter<double>("max_vio_twist_ramp_delta_xy_mps", 0.00);
+  max_vio_twist_ramp_delta_z_mps_ =
+      declare_parameter<double>("max_vio_twist_ramp_delta_z_mps", 0.16);
+
+  use_vio_twist_velocity_ =
+      declare_parameter<bool>("use_vio_twist_velocity", true);
+  smooth_vio_anchor_velocity_ =
+      declare_parameter<bool>("smooth_vio_anchor_velocity", false);
+  vio_velocity_alpha_ = declare_parameter<double>("vio_velocity_alpha", 1.0);
+
+  // Backward compatible name used in older configs.
+  if (!has_parameter("use_vio_twist_velocity")) {
+    use_vio_twist_velocity_ =
+        declare_parameter<bool>("use_vio_velocity", use_vio_twist_velocity_);
+  }
+
+  enable_pose_output_smoothing_ =
+      declare_parameter<bool>("enable_pose_output_smoothing", false);
+  enable_twist_output_smoothing_ =
+      declare_parameter<bool>("enable_twist_output_smoothing", false);
+  pose_output_smoothing_tau_s_ =
+      declare_parameter<double>("pose_output_smoothing_tau_s", 0.04);
+  twist_output_smoothing_tau_s_ =
+      declare_parameter<double>("twist_output_smoothing_tau_s", 0.025);
+  max_output_position_error_m_ =
+      declare_parameter<double>("max_output_position_error_m", 0.05);
+
+  publish_rate_hz_ = std::max(1.0, publish_rate_hz_);
+  max_prediction_horizon_s_ = std::max(0.0, max_prediction_horizon_s_);
+  extra_prediction_s_ = std::max(0.0, extra_prediction_s_);
+  imu_buffer_s_ = std::max(0.1, imu_buffer_s_);
+
+  imu_velocity_prediction_gain_ = std::clamp(imu_velocity_prediction_gain_, 0.0, 1.0);
+  imu_position_prediction_gain_ = std::clamp(imu_position_prediction_gain_, 0.0, 1.0);
+  max_imu_prediction_horizon_s_ = std::max(0.0, max_imu_prediction_horizon_s_);
+  max_imu_velocity_delta_xy_mps_ = std::max(0.0, max_imu_velocity_delta_xy_mps_);
+  max_imu_velocity_delta_z_mps_ = std::max(0.0, max_imu_velocity_delta_z_mps_);
+  max_imu_position_delta_xy_m_ = std::max(0.0, max_imu_position_delta_xy_m_);
+  max_imu_position_delta_z_m_ = std::max(0.0, max_imu_position_delta_z_m_);
+  imu_accel_lpf_tau_s_ = std::max(1.0e-4, imu_accel_lpf_tau_s_);
+  imu_accel_deadband_mps2_ = std::max(0.0, imu_accel_deadband_mps2_);
+
+  vio_twist_ramp_gain_ = std::clamp(vio_twist_ramp_gain_, 0.0, 1.5);
+  vio_twist_ramp_accel_lpf_tau_s_ = std::max(1.0e-4, vio_twist_ramp_accel_lpf_tau_s_);
+  max_vio_twist_ramp_horizon_s_ = std::max(0.0, max_vio_twist_ramp_horizon_s_);
+  max_vio_twist_ramp_delta_xy_mps_ = std::max(0.0, max_vio_twist_ramp_delta_xy_mps_);
+  max_vio_twist_ramp_delta_z_mps_ = std::max(0.0, max_vio_twist_ramp_delta_z_mps_);
+  vio_velocity_alpha_ = std::clamp(vio_velocity_alpha_, 0.0, 1.0);
+  pose_output_smoothing_tau_s_ = std::max(1.0e-4, pose_output_smoothing_tau_s_);
+  twist_output_smoothing_tau_s_ = std::max(1.0e-4, twist_output_smoothing_tau_s_);
 
   R_imu_to_vio_ned_ =
       (Eigen::Matrix3d() << 0.0, 1.0, 0.0,
@@ -49,20 +131,8 @@ QuadEsekfNode::QuadEsekfNode(const rclcpp::NodeOptions & options)
                            0.0, 0.0, -1.0)
           .finished();
 
-  q_imu_to_vio_ned_ = Eigen::Quaterniond(
-      0.0,
-      M_SQRT1_2,
-      M_SQRT1_2,
-      0.0);
-  q_imu_to_vio_ned_.normalize();
-
-  // Conservative initial uncertainty.
-  P_.setZero();
-  P_.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 1.0;    // position
-  P_.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * 1.0;    // velocity
-  P_.block<3, 3>(6, 6) = Eigen::Matrix3d::Identity() * 0.25;   // attitude
-  P_.block<3, 3>(9, 9) = Eigen::Matrix3d::Identity() * 0.01;   // gyro bias
-  P_.block<3, 3>(12, 12) = Eigen::Matrix3d::Identity() * 0.10; // accel bias
+  latest_pose_covariance_.fill(0.0);
+  latest_twist_covariance_.fill(0.0);
 
   rclcpp::SensorDataQoS imu_qos;
   imu_qos.keep_last(1500);
@@ -72,522 +142,496 @@ QuadEsekfNode::QuadEsekfNode(const rclcpp::NodeOptions & options)
       imu_topic_, imu_qos,
       std::bind(&QuadEsekfNode::imuCallback, this, std::placeholders::_1));
 
-  rclcpp::QoS vio_odom_qos(rclcpp::KeepLast(1));
-  vio_odom_qos.best_effort();
-  vio_odom_qos.durability_volatile();
+  rclcpp::QoS vio_qos(rclcpp::KeepLast(1));
+  vio_qos.best_effort();
+  vio_qos.durability_volatile();
 
   vio_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      vio_topic_, vio_odom_qos,
+      vio_topic_, vio_qos,
       std::bind(&QuadEsekfNode::vioCallback, this, std::placeholders::_1));
 
-  rclcpp::QoS fused_odom_qos(rclcpp::KeepLast(1));
-  fused_odom_qos.best_effort();
-  fused_odom_qos.durability_volatile();
+  rclcpp::QoS out_qos(rclcpp::KeepLast(1));
+  out_qos.best_effort();
+  out_qos.durability_volatile();
 
-  odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, fused_odom_qos);
+  odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, out_qos);
 
-  const double safe_rate = std::max(1.0, publish_rate_hz_);
   publish_timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(1.0 / safe_rate)),
+          std::chrono::duration<double>(1.0 / publish_rate_hz_)),
       std::bind(&QuadEsekfNode::publishTimerCallback, this));
 
-  RCLCPP_INFO(get_logger(), "esekf_node started");
-  RCLCPP_INFO(get_logger(), "  IMU topic: %s", imu_topic_.c_str());
-  RCLCPP_INFO(get_logger(), "  VIO topic: %s", vio_topic_.c_str());
-  RCLCPP_INFO(get_logger(), "  output topic: %s @ %.1f Hz", odom_topic_.c_str(), safe_rate);
-  RCLCPP_INFO(get_logger(), "  convention: NED world, gravity = [0, 0, +%.5f] m/s^2", gravity_mps2_);
+  RCLCPP_INFO(get_logger(), "esekf_node started: direct VIO-anchor + IMU preintegration predictor");
   RCLCPP_INFO(
       get_logger(),
-      "  delayed VIO repropagation: %s, vio_delay_s=%.3f, history_buffer_s=%.2f",
-      enable_delayed_vio_repropagation_ ? "enabled" : "disabled",
-      vio_delay_s_,
-      history_buffer_s_);
+      "  imu_pred: pos=%s vel=%s gyro=%s gain_p=%.2f gain_v=%.2f horizon=%.3f extra=%.3f",
+      use_imu_accel_for_position_prediction_ ? "true" : "false",
+      use_imu_accel_for_velocity_prediction_ ? "true" : "false",
+      use_imu_gyro_for_orientation_prediction_ ? "true" : "false",
+      imu_position_prediction_gain_,
+      imu_velocity_prediction_gain_,
+      max_imu_prediction_horizon_s_,
+      extra_prediction_s_);
 }
 
 void QuadEsekfNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mtx_);
 
-  if (!initialized_) {
-    return;
-  }
-
   const rclcpp::Time stamp(msg->header.stamp);
   if (stamp.nanoseconds() == 0) {
-    RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Received IMU message with zero timestamp; skipping");
     return;
   }
 
-  // Keep the raw IMU stream so that delayed VIO corrections can be applied
-  // in the past and then repropagated back to the newest IMU time.
-  if (imu_buffer_.empty() ||
-      rclcpp::Time(imu_buffer_.back().header.stamp) < stamp) {
+  if (imu_buffer_.empty() || rclcpp::Time(imu_buffer_.back().header.stamp) < stamp) {
     imu_buffer_.push_back(*msg);
-  } else {
-    RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Received non-monotonic IMU timestamp; skipping buffer insertion");
+    latest_imu_stamp_ = stamp;
+    pruneImuBuffer(stamp);
   }
-
-  propagateImu(*msg);
-  saveStateSnapshot(last_state_stamp_);
-  pruneBuffers(last_state_stamp_);
 }
 
 void QuadEsekfNode::vioCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mtx_);
 
-  if (!initialized_) {
-    initializeFromVio(*msg);
+  const rclcpp::Time measurement_stamp = getVioMeasurementStamp(*msg);
+  if (measurement_stamp.nanoseconds() == 0) {
     return;
   }
 
-  updateVioPose(*msg);
+  if (!initialized_) {
+    initializeFromVio(*msg, measurement_stamp);
+  } else {
+    updateAnchorFromVio(*msg, measurement_stamp);
+  }
 }
 
 void QuadEsekfNode::publishTimerCallback()
 {
   std::lock_guard<std::mutex> lock(mtx_);
 
-  if (!initialized_ && !publish_until_initialized_) {
+  if (!initialized_) {
     return;
   }
 
-  const rclcpp::Time stamp =
-      initialized_ ? last_state_stamp_ : this->get_clock()->now();
+  const rclcpp::Time target_stamp = getPredictionTargetStamp();
+  State out = predictFromAnchorTo(target_stamp);
 
-  publishOdometry(stamp);
+  if (enable_pose_output_smoothing_ || enable_twist_output_smoothing_) {
+    if (!output_initialized_ ||
+        last_output_stamp_.nanoseconds() == 0 ||
+        target_stamp <= last_output_stamp_) {
+      output_state_ = out;
+      output_initialized_ = true;
+      last_output_stamp_ = target_stamp;
+    } else {
+      double dt = (target_stamp - last_output_stamp_).seconds();
+      dt = std::clamp(dt, 0.0, 0.05);
+
+      if (enable_pose_output_smoothing_) {
+        const double a = std::clamp(1.0 - std::exp(-dt / pose_output_smoothing_tau_s_), 0.0, 1.0);
+        output_state_.p_WB += a * (out.p_WB - output_state_.p_WB);
+        output_state_.q_WB =
+            output_state_.q_WB.normalized().slerp(a, out.q_WB.normalized()).normalized();
+
+        const Eigen::Vector3d e = out.p_WB - output_state_.p_WB;
+        const double en = e.norm();
+        if (max_output_position_error_m_ > 0.0 && en > max_output_position_error_m_) {
+          output_state_.p_WB = out.p_WB - e / en * max_output_position_error_m_;
+        }
+      } else {
+        output_state_.p_WB = out.p_WB;
+        output_state_.q_WB = out.q_WB;
+      }
+
+      if (enable_twist_output_smoothing_) {
+        const double a = std::clamp(1.0 - std::exp(-dt / twist_output_smoothing_tau_s_), 0.0, 1.0);
+        output_state_.v_WB += a * (out.v_WB - output_state_.v_WB);
+      } else {
+        output_state_.v_WB = out.v_WB;
+      }
+
+      last_output_stamp_ = target_stamp;
+    }
+
+    out = output_state_;
+  }
+
+  publishOdometry(out, target_stamp);
 }
 
-void QuadEsekfNode::initializeFromVio(const nav_msgs::msg::Odometry & msg)
+void QuadEsekfNode::initializeFromVio(
+    const nav_msgs::msg::Odometry & msg,
+    const rclcpp::Time & measurement_stamp)
 {
-  x_.p_WB = Eigen::Vector3d(
+  anchor_.p_WB = Eigen::Vector3d(
       msg.pose.pose.position.x,
       msg.pose.pose.position.y,
       msg.pose.pose.position.z);
 
-  x_.v_WB = Eigen::Vector3d(
+  anchor_.q_WB = Eigen::Quaterniond(
+      msg.pose.pose.orientation.w,
+      msg.pose.pose.orientation.x,
+      msg.pose.pose.orientation.y,
+      msg.pose.pose.orientation.z);
+  if (!isFiniteQuaternion(anchor_.q_WB)) {
+    anchor_.q_WB = Eigen::Quaterniond::Identity();
+  } else {
+    anchor_.q_WB.normalize();
+  }
+
+  anchor_.v_WB = Eigen::Vector3d(
       msg.twist.twist.linear.x,
       msg.twist.twist.linear.y,
       msg.twist.twist.linear.z);
+  if (!isFiniteVector(anchor_.v_WB)) {
+    anchor_.v_WB.setZero();
+  }
 
-  x_.q_WB = Eigen::Quaterniond(
-      msg.pose.pose.orientation.w,
-      msg.pose.pose.orientation.x,
-      msg.pose.pose.orientation.y,
-      msg.pose.pose.orientation.z);
-  x_.q_WB.normalize();
+  last_vio_twist_ = anchor_.v_WB;
+  prev_vio_twist_ = anchor_.v_WB;
+  vio_twist_accel_lpf_.setZero();
+  has_last_vio_twist_ = true;
+  has_vio_twist_accel_lpf_ = true;
+  last_vio_twist_dt_s_ = 0.10;
 
-  x_.b_g.setZero();
-  x_.b_a.setZero();
+  previous_vio_ = anchor_;
+  previous_vio_stamp_ = measurement_stamp;
+  has_previous_vio_ = true;
 
-  last_state_stamp_ = rclcpp::Time(msg.header.stamp);
-  last_imu_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+  latest_pose_covariance_ = msg.pose.covariance;
+  latest_twist_covariance_ = msg.twist.covariance;
 
-  imu_buffer_.clear();
-  state_buffer_.clear();
-
+  anchor_stamp_ = measurement_stamp;
+  output_state_ = anchor_;
+  output_initialized_ = true;
+  last_output_stamp_ = measurement_stamp;
   initialized_ = true;
-  saveStateSnapshot(last_state_stamp_);
 
   RCLCPP_INFO(
       get_logger(),
-      "ESEKF initialized from VIO at t=%.9f, p=[%.3f %.3f %.3f]",
-      last_state_stamp_.seconds(), x_.p_WB.x(), x_.p_WB.y(), x_.p_WB.z());
+      "Initialized direct predictor at t=%.9f p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f]",
+      anchor_stamp_.seconds(),
+      anchor_.p_WB.x(), anchor_.p_WB.y(), anchor_.p_WB.z(),
+      anchor_.v_WB.x(), anchor_.v_WB.y(), anchor_.v_WB.z());
 }
 
-void QuadEsekfNode::propagateImu(const sensor_msgs::msg::Imu & msg)
+void QuadEsekfNode::updateAnchorFromVio(
+    const nav_msgs::msg::Odometry & msg,
+    const rclcpp::Time & measurement_stamp)
 {
-  const rclcpp::Time stamp(msg.header.stamp);
+  State vio;
 
-  if (last_imu_stamp_.nanoseconds() == 0) {
-    last_imu_stamp_ = stamp;
-    last_state_stamp_ = stamp;
-    return;
-  }
-
-  double dt = (stamp - last_imu_stamp_).seconds();
-  last_imu_stamp_ = stamp;
-
-  if (!std::isfinite(dt) || dt < kMinDt) {
-    return;
-  }
-
-  if (dt > kMaxDt) {
-    RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Large IMU dt %.4f s clamped to %.4f s", dt, kMaxDt);
-    dt = kMaxDt;
-  }
-
-  Eigen::Vector3d omega_raw(
-      msg.angular_velocity.x,
-      msg.angular_velocity.y,
-      msg.angular_velocity.z);
-
-  Eigen::Vector3d accel_raw(
-      msg.linear_acceleration.x,
-      msg.linear_acceleration.y,
-      msg.linear_acceleration.z);
-
-  // Raw IMU 6-axis vectors -> VIO/NED-aligned body frame.
-  const Eigen::Vector3d omega = R_imu_to_vio_ned_ * omega_raw;
-  const Eigen::Vector3d accel = R_imu_to_vio_ned_ * accel_raw;
-
-  const Eigen::Vector3d omega_unbiased = omega - x_.b_g;
-  const Eigen::Vector3d accel_unbiased = accel - x_.b_a;
-
-  const Eigen::Matrix3d R_WB = x_.q_WB.toRotationMatrix();
-  const Eigen::Vector3d g_W(0.0, 0.0, gravity_mps2_);
-
-  // Nominal propagation.
-  const Eigen::Vector3d a_W = R_WB * accel_unbiased + g_W;
-  x_.p_WB += x_.v_WB * dt + 0.5 * a_W * dt * dt;
-  x_.v_WB += a_W * dt;
-  x_.q_WB = (x_.q_WB * smallAngleQuaternion(omega_unbiased * dt)).normalized();
-
-  // Error-state propagation.
-  // Error vector: [dp, dv, dtheta, dbg, dba].
-  Eigen::Matrix<double, kErrDim, kErrDim> F =
-      Eigen::Matrix<double, kErrDim, kErrDim>::Identity();
-
-  F.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity() * dt;
-  F.block<3, 3>(3, 6) = -R_WB * skew(accel_unbiased) * dt;
-  F.block<3, 3>(3, 12) = -R_WB * dt;
-  F.block<3, 3>(6, 6) =
-      Eigen::Matrix3d::Identity() - skew(omega_unbiased) * dt;
-  F.block<3, 3>(6, 9) = -Eigen::Matrix3d::Identity() * dt;
-
-  Eigen::Matrix<double, kErrDim, kErrDim> Q =
-      Eigen::Matrix<double, kErrDim, kErrDim>::Zero();
-
-  const double gyro_var = gyro_noise_density_ * gyro_noise_density_;
-  const double accel_var = accel_noise_density_ * accel_noise_density_;
-  const double gyro_bias_var = gyro_bias_random_walk_ * gyro_bias_random_walk_;
-  const double accel_bias_var = accel_bias_random_walk_ * accel_bias_random_walk_;
-
-  Q.block<3, 3>(3, 3) = R_WB * Eigen::Matrix3d::Identity() * accel_var * R_WB.transpose() * dt * dt;
-  Q.block<3, 3>(6, 6) = Eigen::Matrix3d::Identity() * gyro_var * dt * dt;
-  Q.block<3, 3>(9, 9) = Eigen::Matrix3d::Identity() * gyro_bias_var * dt;
-  Q.block<3, 3>(12, 12) = Eigen::Matrix3d::Identity() * accel_bias_var * dt;
-
-  P_ = F * P_ * F.transpose() + Q;
-  P_ = 0.5 * (P_ + P_.transpose());
-
-  last_state_stamp_ = stamp;
-}
-
-void QuadEsekfNode::updateVioPose(const nav_msgs::msg::Odometry & msg)
-{
-  rclcpp::Time measurement_stamp(msg.header.stamp);
-
-  if (measurement_stamp.nanoseconds() == 0) {
-    RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Received VIO odometry with zero timestamp; skipping update");
-    return;
-  }
-
-  // If the VIO odometry timestamp represents publication time rather than the
-  // original image/estimation time, compensate a known fixed delay here.
-  // If your VIO header.stamp is already the image/state time, keep vio_delay_s=0.
-  if (vio_delay_s_ > 0.0) {
-    measurement_stamp =
-        measurement_stamp - rclcpp::Duration::from_seconds(vio_delay_s_);
-  }
-
-  if (!enable_delayed_vio_repropagation_) {
-    updateVioMeasurementAtCurrentState(msg);
-    return;
-  }
-
-  if (state_buffer_.empty() || imu_buffer_.empty()) {
-    updateVioMeasurementAtCurrentState(msg);
-    saveStateSnapshot(last_state_stamp_);
-    return;
-  }
-
-  const rclcpp::Time newest_state_stamp = last_state_stamp_;
-
-  // If the measurement is newer than the current propagated state, just update
-  // the current state. This can happen at startup or with unusual timestamps.
-  if (measurement_stamp >= newest_state_stamp) {
-    updateVioMeasurementAtCurrentState(msg);
-    saveStateSnapshot(last_state_stamp_);
-    return;
-  }
-
-  const int snapshot_idx = findSnapshotIndexBeforeOrAt(measurement_stamp);
-  if (snapshot_idx < 0) {
-    RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "VIO measurement too old for history buffer: vio_t=%.6f oldest_state_t=%.6f",
-        measurement_stamp.seconds(),
-        state_buffer_.empty() ? 0.0 : state_buffer_.front().stamp.seconds());
-    return;
-  }
-
-  const Snapshot snapshot = state_buffer_[static_cast<size_t>(snapshot_idx)];
-
-  // Restore the filter at the closest historical state before/at the VIO
-  // measurement time, apply the VIO correction there, then repropagate all IMU
-  // samples that occurred after that historical state.
-  x_ = snapshot.state;
-  P_ = snapshot.covariance;
-  last_state_stamp_ = snapshot.stamp;
-  last_imu_stamp_ = snapshot.stamp;
-
-  updateVioMeasurementAtCurrentState(msg);
-
-  // Drop snapshots after the correction time. They are no longer valid because
-  // the state history has changed after the delayed update.
-  eraseStateSnapshotsAfter(snapshot.stamp);
-  saveStateSnapshot(last_state_stamp_);
-
-  size_t repropagated_imu_count = 0;
-  for (const auto & imu_msg : imu_buffer_) {
-    const rclcpp::Time imu_stamp(imu_msg.header.stamp);
-    if (imu_stamp <= snapshot.stamp) {
-      continue;
-    }
-
-    // Repropagate only up to the newest state we had before applying the delayed
-    // update. Newer IMUs will arrive normally through imuCallback.
-    if (imu_stamp > newest_state_stamp) {
-      break;
-    }
-
-    propagateImu(imu_msg);
-    saveStateSnapshot(last_state_stamp_);
-    ++repropagated_imu_count;
-  }
-
-  pruneBuffers(last_state_stamp_);
-
-  RCLCPP_DEBUG(
-      get_logger(),
-      "Delayed VIO update applied at %.6f using snapshot %.6f and repropagated %zu IMUs to %.6f",
-      measurement_stamp.seconds(),
-      snapshot.stamp.seconds(),
-      repropagated_imu_count,
-      last_state_stamp_.seconds());
-}
-
-void QuadEsekfNode::updateVioMeasurementAtCurrentState(const nav_msgs::msg::Odometry & msg)
-{
-  Eigen::Vector3d p_meas(
+  vio.p_WB = Eigen::Vector3d(
       msg.pose.pose.position.x,
       msg.pose.pose.position.y,
       msg.pose.pose.position.z);
 
-  Eigen::Quaterniond q_meas(
+  vio.q_WB = Eigen::Quaterniond(
       msg.pose.pose.orientation.w,
       msg.pose.pose.orientation.x,
       msg.pose.pose.orientation.y,
       msg.pose.pose.orientation.z);
-  q_meas.normalize();
-
-  const int meas_dim = use_vio_velocity_ ? 9 : 6;
-
-  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(meas_dim, kErrDim);
-  Eigen::VectorXd r = Eigen::VectorXd::Zero(meas_dim);
-  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(meas_dim, meas_dim);
-
-  // Position residual.
-  r.segment<3>(0) = p_meas - x_.p_WB;
-  H.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
-
-  const double px_var = getVarianceOrDefault(msg.pose.covariance, 0, vio_pos_std_ * vio_pos_std_);
-  const double py_var = getVarianceOrDefault(msg.pose.covariance, 7, vio_pos_std_ * vio_pos_std_);
-  const double pz_var = getVarianceOrDefault(msg.pose.covariance, 14, vio_pos_std_ * vio_pos_std_);
-  R.block<3, 3>(0, 0) = makeDiagonalNoise(px_var, py_var, pz_var);
-
-  // Orientation residual. Compatible with left-multiplicative correction:
-  // q_corrected = Exp(dtheta) * q_nominal.
-  Eigen::Quaterniond dq = q_meas * x_.q_WB.conjugate();
-  if (dq.w() < 0.0) {
-    dq.coeffs() *= -1.0;
+  if (!isFiniteQuaternion(vio.q_WB)) {
+    vio.q_WB = anchor_.q_WB;
+  } else {
+    vio.q_WB.normalize();
   }
 
-  r.segment<3>(3) = quaternionLog(dq);
-  H.block<3, 3>(3, 6) = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d raw_v = anchor_.v_WB;
 
-  const double ox_var = getVarianceOrDefault(msg.pose.covariance, 21, vio_ori_std_rad_ * vio_ori_std_rad_);
-  const double oy_var = getVarianceOrDefault(msg.pose.covariance, 28, vio_ori_std_rad_ * vio_ori_std_rad_);
-  const double oz_var = getVarianceOrDefault(msg.pose.covariance, 35, vio_ori_std_rad_ * vio_ori_std_rad_);
-  R.block<3, 3>(3, 3) = makeDiagonalNoise(ox_var, oy_var, oz_var);
-
-  if (use_vio_velocity_) {
-    Eigen::Vector3d v_meas(
+  if (use_vio_twist_velocity_) {
+    raw_v = Eigen::Vector3d(
         msg.twist.twist.linear.x,
         msg.twist.twist.linear.y,
         msg.twist.twist.linear.z);
-
-    r.segment<3>(6) = v_meas - x_.v_WB;
-    H.block<3, 3>(6, 3) = Eigen::Matrix3d::Identity();
-
-    const double vx_var = getVarianceOrDefault(msg.twist.covariance, 0, vio_vel_std_ * vio_vel_std_);
-    const double vy_var = getVarianceOrDefault(msg.twist.covariance, 7, vio_vel_std_ * vio_vel_std_);
-    const double vz_var = getVarianceOrDefault(msg.twist.covariance, 14, vio_vel_std_ * vio_vel_std_);
-    R.block<3, 3>(6, 6) = makeDiagonalNoise(vx_var, vy_var, vz_var);
-  }
-
-  const Eigen::MatrixXd S = H * P_ * H.transpose() + R;
-  const Eigen::MatrixXd K = P_ * H.transpose() * S.inverse();
-
-  const Eigen::Matrix<double, kErrDim, 1> dx = K * r;
-
-  const Eigen::Matrix<double, kErrDim, kErrDim> I =
-      Eigen::Matrix<double, kErrDim, kErrDim>::Identity();
-
-  // Joseph form for numerical stability.
-  P_ = (I - K * H) * P_ * (I - K * H).transpose() + K * R * K.transpose();
-  P_ = 0.5 * (P_ + P_.transpose());
-
-  applyErrorCorrection(dx);
-}
-
-
-void QuadEsekfNode::saveStateSnapshot(const rclcpp::Time & stamp)
-{
-  if (stamp.nanoseconds() == 0) {
-    return;
-  }
-
-  if (!state_buffer_.empty() && state_buffer_.back().stamp == stamp) {
-    state_buffer_.back().state = x_;
-    state_buffer_.back().covariance = P_;
-    return;
-  }
-
-  if (!state_buffer_.empty() && state_buffer_.back().stamp > stamp) {
-    // Keep the buffer time-ordered. This should only happen after a restore;
-    // remove invalid future snapshots and append the corrected one.
-    eraseStateSnapshotsAfter(stamp);
-  }
-
-  Snapshot snapshot;
-  snapshot.stamp = stamp;
-  snapshot.state = x_;
-  snapshot.covariance = P_;
-  state_buffer_.push_back(snapshot);
-}
-
-void QuadEsekfNode::pruneBuffers(const rclcpp::Time & newest_stamp)
-{
-  if (newest_stamp.nanoseconds() == 0 || history_buffer_s_ <= 0.0) {
-    return;
-  }
-
-  const rclcpp::Time oldest_allowed =
-      newest_stamp - rclcpp::Duration::from_seconds(history_buffer_s_);
-
-  while (!imu_buffer_.empty() &&
-         rclcpp::Time(imu_buffer_.front().header.stamp) < oldest_allowed) {
-    imu_buffer_.pop_front();
-  }
-
-  while (state_buffer_.size() > 2 && state_buffer_.front().stamp < oldest_allowed) {
-    state_buffer_.pop_front();
-  }
-}
-
-int QuadEsekfNode::findSnapshotIndexBeforeOrAt(const rclcpp::Time & stamp) const
-{
-  if (state_buffer_.empty()) {
-    return -1;
-  }
-
-  int best_idx = -1;
-  for (size_t i = 0; i < state_buffer_.size(); ++i) {
-    if (state_buffer_[i].stamp <= stamp) {
-      best_idx = static_cast<int>(i);
-    } else {
-      break;
+    if (!isFiniteVector(raw_v)) {
+      raw_v = anchor_.v_WB;
+    }
+  } else if (has_previous_vio_) {
+    const double dt = (measurement_stamp - previous_vio_stamp_).seconds();
+    if (std::isfinite(dt) && dt > 1.0e-4 && dt < 1.0) {
+      raw_v = (vio.p_WB - previous_vio_.p_WB) / dt;
     }
   }
 
-  return best_idx;
-}
-
-void QuadEsekfNode::eraseStateSnapshotsAfter(const rclcpp::Time & stamp)
-{
-  while (!state_buffer_.empty() && state_buffer_.back().stamp > stamp) {
-    state_buffer_.pop_back();
+  // Critical: the anchor velocity should not be low-pass filtered if we are
+  // trying to remove delay. Smoothing here directly creates phase lag.
+  if (smooth_vio_anchor_velocity_) {
+    vio.v_WB =
+        (1.0 - vio_velocity_alpha_) * anchor_.v_WB +
+        vio_velocity_alpha_ * raw_v;
+  } else {
+    vio.v_WB = raw_v;
   }
+
+  previous_vio_ = vio;
+  previous_vio_stamp_ = measurement_stamp;
+  has_previous_vio_ = true;
+
+  anchor_ = vio;
+  anchor_stamp_ = measurement_stamp;
+
+  latest_pose_covariance_ = msg.pose.covariance;
+  latest_twist_covariance_ = msg.twist.covariance;
 }
 
 
-void QuadEsekfNode::applyErrorCorrection(
-    const Eigen::Matrix<double, kErrDim, 1> & dx)
+Eigen::Vector3d QuadEsekfNode::computeVioTwistRampDelta(double horizon_s) const
 {
-  x_.p_WB += dx.segment<3>(0);
-  x_.v_WB += dx.segment<3>(3);
-  x_.q_WB = (smallAngleQuaternion(dx.segment<3>(6)) * x_.q_WB).normalized();
-  x_.b_g += dx.segment<3>(9);
-  x_.b_a += dx.segment<3>(12);
+  Eigen::Vector3d dv = Eigen::Vector3d::Zero();
 
-  // Reset Jacobian is approximated as identity for this first implementation.
+  if (!use_vio_twist_ramp_prediction_ ||
+      !has_vio_twist_accel_lpf_ ||
+      !std::isfinite(horizon_s) ||
+      horizon_s <= 0.0) {
+    return dv;
+  }
+
+  const double h = std::clamp(horizon_s, 0.0, max_vio_twist_ramp_horizon_s_);
+
+  dv = vio_twist_ramp_gain_ * vio_twist_accel_lpf_ * h;
+
+  dv.x() = std::clamp(dv.x(), -max_vio_twist_ramp_delta_xy_mps_, max_vio_twist_ramp_delta_xy_mps_);
+  dv.y() = std::clamp(dv.y(), -max_vio_twist_ramp_delta_xy_mps_, max_vio_twist_ramp_delta_xy_mps_);
+  dv.z() = std::clamp(dv.z(), -max_vio_twist_ramp_delta_z_mps_, max_vio_twist_ramp_delta_z_mps_);
+
+  if (use_vio_twist_ramp_for_z_only_) {
+    dv.x() = 0.0;
+    dv.y() = 0.0;
+  }
+
+  return dv;
 }
 
-void QuadEsekfNode::publishOdometry(const rclcpp::Time & stamp)
+QuadEsekfNode::State QuadEsekfNode::predictFromAnchorTo(const rclcpp::Time & target_stamp) const
+{
+  State pred = anchor_;
+
+  if (target_stamp.nanoseconds() == 0 || anchor_stamp_.nanoseconds() == 0 || target_stamp <= anchor_stamp_) {
+    return pred;
+  }
+
+  double total_dt = (target_stamp - anchor_stamp_).seconds();
+  if (!std::isfinite(total_dt) || total_dt <= 0.0) {
+    return pred;
+  }
+
+  total_dt = std::min(total_dt, max_prediction_horizon_s_);
+
+  const double imu_dt = std::min(total_dt, max_imu_prediction_horizon_s_);
+  const rclcpp::Time imu_target =
+      anchor_stamp_ + rclcpp::Duration::from_seconds(imu_dt);
+
+  ImuDelta delta = integrateImuDelta(anchor_, anchor_stamp_, imu_target);
+
+  const Eigen::Quaterniond q_pred =
+      use_imu_gyro_for_orientation_prediction_ && delta.valid
+          ? (anchor_.q_WB * delta.dq).normalized()
+          : anchor_.q_WB;
+
+  Eigen::Vector3d dv = Eigen::Vector3d::Zero();
+  Eigen::Vector3d dp_accel = Eigen::Vector3d::Zero();
+
+  if (delta.valid) {
+    dv = delta.dv_W;
+    dv.x() = std::clamp(dv.x(), -max_imu_velocity_delta_xy_mps_, max_imu_velocity_delta_xy_mps_);
+    dv.y() = std::clamp(dv.y(), -max_imu_velocity_delta_xy_mps_, max_imu_velocity_delta_xy_mps_);
+    dv.z() = std::clamp(dv.z(), -max_imu_velocity_delta_z_mps_, max_imu_velocity_delta_z_mps_);
+
+    dp_accel = delta.dp_W;
+    dp_accel.x() = std::clamp(dp_accel.x(), -max_imu_position_delta_xy_m_, max_imu_position_delta_xy_m_);
+    dp_accel.y() = std::clamp(dp_accel.y(), -max_imu_position_delta_xy_m_, max_imu_position_delta_xy_m_);
+    dp_accel.z() = std::clamp(dp_accel.z(), -max_imu_position_delta_z_m_, max_imu_position_delta_z_m_);
+  }
+
+  pred.q_WB = q_pred;
+
+  pred.v_WB = anchor_.v_WB;
+
+  if (use_imu_accel_for_velocity_prediction_ && delta.valid) {
+    pred.v_WB.x() += imu_velocity_prediction_gain_ * imu_velocity_prediction_gain_xy_ * dv.x();
+    pred.v_WB.y() += imu_velocity_prediction_gain_ * imu_velocity_prediction_gain_xy_ * dv.y();
+    pred.v_WB.z() += imu_velocity_prediction_gain_ * imu_velocity_prediction_gain_z_ * dv.z();
+  }
+
+  // Add a VIO twist-ramp delta. This is the main fix for takeoff Vz:
+  // it avoids sample-and-hold velocity while staying attached to the VIO trend.
+  pred.v_WB += computeVioTwistRampDelta(total_dt);
+
+  // Position prediction uses the anchor velocity over the full horizon plus a
+  // bounded IMU double-integral over the short IMU horizon. This avoids the old
+  // "pose follows VIO only, twist predicted separately" inconsistency.
+  pred.p_WB = anchor_.p_WB + anchor_.v_WB * total_dt;
+  if (use_imu_accel_for_position_prediction_ && delta.valid) {
+    pred.p_WB += imu_position_prediction_gain_ * dp_accel;
+  }
+
+  return pred;
+}
+
+QuadEsekfNode::ImuDelta QuadEsekfNode::integrateImuDelta(
+    const State & anchor,
+    const rclcpp::Time & t0,
+    const rclcpp::Time & t1) const
+{
+  ImuDelta out;
+
+  if (imu_buffer_.empty() || t1 <= t0) {
+    return out;
+  }
+
+  Eigen::Quaterniond q_delta = Eigen::Quaterniond::Identity();
+  Eigen::Quaterniond q_WB = anchor.q_WB.normalized();
+
+  Eigen::Vector3d dv = Eigen::Vector3d::Zero();
+  Eigen::Vector3d dp = Eigen::Vector3d::Zero();
+
+  Eigen::Vector3d a_filt = Eigen::Vector3d::Zero();
+  bool a_filt_initialized = false;
+
+  rclcpp::Time prev_stamp = t0;
+
+  for (const auto & imu_msg : imu_buffer_) {
+    const rclcpp::Time imu_stamp(imu_msg.header.stamp);
+
+    if (imu_stamp <= t0) {
+      continue;
+    }
+    if (imu_stamp > t1) {
+      break;
+    }
+
+    double dt = (imu_stamp - prev_stamp).seconds();
+    if (!std::isfinite(dt) || dt <= kMinDt) {
+      prev_stamp = imu_stamp;
+      continue;
+    }
+    dt = std::min(dt, kMaxImuDt);
+
+    const Eigen::Vector3d omega =
+        transformImuVector(R_imu_to_vio_ned_, imu_msg.angular_velocity);
+    const Eigen::Vector3d accel =
+        transformImuVector(R_imu_to_vio_ned_, imu_msg.linear_acceleration);
+
+    if (isFiniteVector(omega)) {
+      const Eigen::Quaterniond dq = smallAngleQuaternion(omega * dt);
+      q_delta = (q_delta * dq).normalized();
+      q_WB = (q_WB * dq).normalized();
+    }
+
+    if (isFiniteVector(accel)) {
+      Eigen::Vector3d a_W =
+          q_WB.toRotationMatrix() * accel + Eigen::Vector3d(0.0, 0.0, gravity_mps2_);
+
+      for (int i = 0; i < 3; ++i) {
+        if (std::abs(a_W[i]) < imu_accel_deadband_mps2_) {
+          a_W[i] = 0.0;
+        }
+      }
+
+      if (!a_filt_initialized) {
+        a_filt = a_W;
+        a_filt_initialized = true;
+      } else {
+        const double alpha =
+            std::clamp(1.0 - std::exp(-dt / imu_accel_lpf_tau_s_), 0.0, 1.0);
+        a_filt += alpha * (a_W - a_filt);
+      }
+
+      dp += dv * dt + 0.5 * a_filt * dt * dt;
+      dv += a_filt * dt;
+      out.valid = true;
+      out.dt += dt;
+    }
+
+    prev_stamp = imu_stamp;
+  }
+
+  out.dp_W = dp;
+  out.dv_W = dv;
+  out.dq = q_delta.normalized();
+
+  return out;
+}
+
+void QuadEsekfNode::publishOdometry(const State & state, const rclcpp::Time & stamp)
 {
   nav_msgs::msg::Odometry odom;
   odom.header.stamp = stamp;
   odom.header.frame_id = world_frame_id_;
   odom.child_frame_id = body_frame_id_;
 
-  odom.pose.pose.position.x = x_.p_WB.x();
-  odom.pose.pose.position.y = x_.p_WB.y();
-  odom.pose.pose.position.z = x_.p_WB.z();
+  odom.pose.pose.position.x = state.p_WB.x();
+  odom.pose.pose.position.y = state.p_WB.y();
+  odom.pose.pose.position.z = state.p_WB.z();
 
-  odom.pose.pose.orientation.w = x_.q_WB.w();
-  odom.pose.pose.orientation.x = x_.q_WB.x();
-  odom.pose.pose.orientation.y = x_.q_WB.y();
-  odom.pose.pose.orientation.z = x_.q_WB.z();
+  const Eigen::Quaterniond q = state.q_WB.normalized();
+  odom.pose.pose.orientation.w = q.w();
+  odom.pose.pose.orientation.x = q.x();
+  odom.pose.pose.orientation.y = q.y();
+  odom.pose.pose.orientation.z = q.z();
 
-  odom.twist.twist.linear.x = x_.v_WB.x();
-  odom.twist.twist.linear.y = x_.v_WB.y();
-  odom.twist.twist.linear.z = x_.v_WB.z();
+  odom.twist.twist.linear.x = state.v_WB.x();
+  odom.twist.twist.linear.y = state.v_WB.y();
+  odom.twist.twist.linear.z = state.v_WB.z();
 
-  // Fill pose covariance from error-state covariance.
-  for (int i = 0; i < 36; ++i) {
-    odom.pose.covariance[i] = 0.0;
-    odom.twist.covariance[i] = 0.0;
-  }
-
-  // ROS covariance order: x, y, z, rot_x, rot_y, rot_z.
-  odom.pose.covariance[0] = P_(0, 0);
-  odom.pose.covariance[7] = P_(1, 1);
-  odom.pose.covariance[14] = P_(2, 2);
-  odom.pose.covariance[21] = P_(6, 6);
-  odom.pose.covariance[28] = P_(7, 7);
-  odom.pose.covariance[35] = P_(8, 8);
-
-  odom.twist.covariance[0] = P_(3, 3);
-  odom.twist.covariance[7] = P_(4, 4);
-  odom.twist.covariance[14] = P_(5, 5);
+  odom.pose.covariance = latest_pose_covariance_;
+  odom.twist.covariance = latest_twist_covariance_;
 
   odom_pub_->publish(odom);
 }
 
-Eigen::Matrix3d QuadEsekfNode::skew(const Eigen::Vector3d & v)
+rclcpp::Time QuadEsekfNode::getVioMeasurementStamp(const nav_msgs::msg::Odometry & msg) const
 {
-  Eigen::Matrix3d S;
-  S << 0.0, -v.z(), v.y(),
-       v.z(), 0.0, -v.x(),
-       -v.y(), v.x(), 0.0;
-  return S;
+  rclcpp::Time stamp(msg.header.stamp);
+
+  if (vio_delay_s_ > 0.0) {
+    stamp = stamp - rclcpp::Duration::from_seconds(vio_delay_s_);
+  }
+
+  return stamp;
+}
+
+rclcpp::Time QuadEsekfNode::getPredictionTargetStamp() const
+{
+  rclcpp::Time target = anchor_stamp_;
+
+  if (latest_imu_stamp_.nanoseconds() > 0 && latest_imu_stamp_ > target) {
+    target = latest_imu_stamp_;
+  }
+
+  if (extra_prediction_s_ > 0.0) {
+    target = target + rclcpp::Duration::from_seconds(extra_prediction_s_);
+  }
+
+  if (anchor_stamp_.nanoseconds() > 0 && max_prediction_horizon_s_ > 0.0) {
+    const rclcpp::Time max_target =
+        anchor_stamp_ + rclcpp::Duration::from_seconds(max_prediction_horizon_s_);
+    if (target > max_target) {
+      target = max_target;
+    }
+  }
+
+  return target;
+}
+
+void QuadEsekfNode::pruneImuBuffer(const rclcpp::Time & newest_stamp)
+{
+  const rclcpp::Time oldest_allowed =
+      newest_stamp - rclcpp::Duration::from_seconds(imu_buffer_s_);
+
+  while (!imu_buffer_.empty() &&
+         rclcpp::Time(imu_buffer_.front().header.stamp) < oldest_allowed) {
+    imu_buffer_.pop_front();
+  }
 }
 
 Eigen::Quaterniond QuadEsekfNode::smallAngleQuaternion(const Eigen::Vector3d & dtheta)
 {
   const double angle = dtheta.norm();
-  if (angle < 1.0e-12) {
+
+  if (!std::isfinite(angle) || angle < 1.0e-12) {
     return Eigen::Quaterniond(
         1.0,
         0.5 * dtheta.x(),
@@ -595,52 +639,30 @@ Eigen::Quaterniond QuadEsekfNode::smallAngleQuaternion(const Eigen::Vector3d & d
         0.5 * dtheta.z()).normalized();
   }
 
-  const Eigen::Vector3d axis = dtheta / angle;
-  return Eigen::Quaterniond(Eigen::AngleAxisd(angle, axis)).normalized();
+  return Eigen::Quaterniond(Eigen::AngleAxisd(angle, dtheta / angle)).normalized();
 }
 
-Eigen::Vector3d QuadEsekfNode::quaternionLog(const Eigen::Quaterniond & q_in)
+Eigen::Vector3d QuadEsekfNode::transformImuVector(
+    const Eigen::Matrix3d & R_imu_to_vio_ned,
+    const geometry_msgs::msg::Vector3 & v)
 {
-  Eigen::Quaterniond q = q_in.normalized();
-  if (q.w() < 0.0) {
-    q.coeffs() *= -1.0;
-  }
-
-  const Eigen::Vector3d v(q.x(), q.y(), q.z());
-  const double v_norm = v.norm();
-
-  if (v_norm < 1.0e-12) {
-    return 2.0 * v;
-  }
-
-  const double angle = 2.0 * std::atan2(v_norm, q.w());
-  return angle * v / v_norm;
+  return R_imu_to_vio_ned * Eigen::Vector3d(v.x, v.y, v.z);
 }
 
-double QuadEsekfNode::getVarianceOrDefault(
-    const std::array<double, 36> & cov,
-    int idx,
-    double fallback)
+bool QuadEsekfNode::isFiniteQuaternion(const Eigen::Quaterniond & q)
 {
-  if (idx < 0 || idx >= 36) {
-    return fallback;
-  }
-
-  const double value = cov[static_cast<size_t>(idx)];
-  if (!std::isfinite(value) || value < kDegenerateCovThreshold) {
-    return fallback;
-  }
-
-  return value;
+  return std::isfinite(q.w()) &&
+         std::isfinite(q.x()) &&
+         std::isfinite(q.y()) &&
+         std::isfinite(q.z()) &&
+         q.norm() > 1.0e-9;
 }
 
-Eigen::Matrix3d QuadEsekfNode::makeDiagonalNoise(double x, double y, double z)
+bool QuadEsekfNode::isFiniteVector(const Eigen::Vector3d & v)
 {
-  Eigen::Matrix3d R = Eigen::Matrix3d::Zero();
-  R(0, 0) = std::max(x, kDegenerateCovThreshold);
-  R(1, 1) = std::max(y, kDegenerateCovThreshold);
-  R(2, 2) = std::max(z, kDegenerateCovThreshold);
-  return R;
+  return std::isfinite(v.x()) &&
+         std::isfinite(v.y()) &&
+         std::isfinite(v.z());
 }
 
 }  // namespace mavtech_filter
