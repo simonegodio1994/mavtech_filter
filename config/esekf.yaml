@@ -1,7 +1,7 @@
 esekf_node:
   ros__parameters:
     vio_delay_s: 0.0
-    publish_rate_hz: 50.0
+    publish_rate_hz: 100.0
 
     use_vio_twist_velocity: true
     smooth_vio_anchor_velocity: false
@@ -22,7 +22,7 @@ esekf_node:
     max_imu_position_delta_xy_m: 0.005
     max_imu_position_delta_z_m: 0.010
 
-    imu_accel_lpf_tau_s: 0.080
+    imu_accel_lpf_tau_s: 0.025
     imu_accel_deadband_mps2: 0.12
 
     use_vio_twist_ramp_prediction: true

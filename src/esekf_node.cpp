@@ -24,7 +24,7 @@ QuadEsekfNode::QuadEsekfNode(const rclcpp::NodeOptions & options)
   world_frame_id_ = declare_parameter<std::string>("world_frame_id", "world_ned");
   body_frame_id_ = declare_parameter<std::string>("body_frame_id", "base_link");
 
-  publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 50.0);
+  publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 200.0);
   vio_delay_s_ = declare_parameter<double>("vio_delay_s", 0.0);
   max_prediction_horizon_s_ = declare_parameter<double>("max_prediction_horizon_s", 0.12);
   extra_prediction_s_ = declare_parameter<double>("extra_prediction_s", 0.0);
