@@ -24,6 +24,10 @@ add_executable(esekf_node
   src/esekf_node.cpp
 )
 
+add_executable(tf_broadcaster
+  src/tf_broadcaster.cpp
+)
+
 add_executable(esekf_interface
   src/esekf_interface.cpp
 )
@@ -43,6 +47,17 @@ ament_target_dependencies(esekf_node
   Eigen3
 )
 
+ament_target_dependencies(tf_broadcaster
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
+  px4_msgs
+  tf2
+  tf2_eigen
+  Eigen3
+)
+
 ament_target_dependencies(esekf_interface
   rclcpp
   sensor_msgs
@@ -52,6 +67,15 @@ ament_target_dependencies(esekf_interface
   tf2
   tf2_eigen
   Eigen3
+)
+
+target_include_directories(tf_broadcaster PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+install(TARGETS tf_broadcaster
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 target_include_directories(esekf_node PUBLIC
