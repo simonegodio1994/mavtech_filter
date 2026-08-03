@@ -410,13 +410,13 @@ private:
     // Same values as your Python bridge.
     // Tune these carefully because PX4 EKF2 trust is very sensitive here.
     // ------------------------------------------------------------
-    msg.position_variance[0] = 0.0036F;  // std 6 cm
-    msg.position_variance[1] = 0.0036F;
-    msg.position_variance[2] = 0.0036F;
+    msg.position_variance[0] = 0.0026F;  // std 6 cm
+    msg.position_variance[1] = 0.0026F;
+    msg.position_variance[2] = 0.0026F;
 
-    msg.velocity_variance[0] = 0.04F;  // std 15 cm/s
-    msg.velocity_variance[1] = 0.04F;
-    msg.velocity_variance[2] = 0.04F;    // std 20 cm/s
+    msg.velocity_variance[0] = 0.004F;  // std 15 cm/s
+    msg.velocity_variance[1] = 0.004F;
+    msg.velocity_variance[2] = 0.004F;    // std 20 cm/s
 
     msg.orientation_variance[0] = 0.001F;
     msg.orientation_variance[1] = 0.001F;
