@@ -28,6 +28,10 @@ add_executable(tf_broadcaster
   src/tf_broadcaster.cpp
 )
 
+add_executable(odom_sim_converter
+  src/odom_sim_converter.cpp
+)
+
 add_executable(esekf_interface
   src/esekf_interface.cpp
 )
@@ -58,6 +62,17 @@ ament_target_dependencies(tf_broadcaster
   Eigen3
 )
 
+ament_target_dependencies(odom_sim_converter
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  geometry_msgs
+  px4_msgs
+  tf2
+  tf2_eigen
+  Eigen3
+)
+
 ament_target_dependencies(esekf_interface
   rclcpp
   sensor_msgs
@@ -75,6 +90,15 @@ target_include_directories(tf_broadcaster PUBLIC
 )
 
 install(TARGETS tf_broadcaster
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+target_include_directories(odom_sim_converter PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+install(TARGETS odom_sim_converter
   DESTINATION lib/${PROJECT_NAME}
 )
 
