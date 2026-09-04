@@ -66,13 +66,17 @@ public:
     // PX4 side usually expects best effort + transient local.
     // Input odometry should stay low-latency: keep only latest sample.
     // ------------------------------------------------------------
-    auto px4_qos = rclcpp::QoS(rclcpp::KeepLast(1));
-    px4_qos.best_effort();
-    px4_qos.transient_local();
+    // auto px4_qos = rclcpp::QoS(rclcpp::KeepLast(1));
+    // px4_qos.best_effort();
+    // px4_qos.transient_local();
 
-    auto odom_qos = rclcpp::QoS(rclcpp::KeepLast(1));
-    odom_qos.best_effort();
-    odom_qos.durability_volatile();
+    auto px4_qos = rclcpp::QoS(rclcpp::KeepLast(3))
+    .best_effort()
+    .durability_volatile();
+
+    auto odom_qos = rclcpp::QoS(rclcpp::KeepLast(3))
+    .best_effort()
+    .durability_volatile();
 
     publisher_ = create_publisher<px4_msgs::msg::VehicleOdometry>(
       output_topic_, px4_qos);
